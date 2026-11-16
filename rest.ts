@@ -2,7 +2,7 @@
 // contents, labels, issues, comments and pull requests. Every reply is JSON
 // and carries X-GitHub-Request-Id; errors carry a string message.
 
-import { parseCommit } from './gitobj.ts';
+import { parseCommit, parseTree } from './gitobj.ts';
 import { isoFromSec, type Issue, type Repo, type Store } from './store.ts';
 
 export interface RestRequest {

@@ -103,7 +103,10 @@ function tokenize(src: string): Token[] {
 
 class Parser {
   private pos = 0;
-  constructor(private readonly tokens: Token[]) {}
+  private readonly tokens: Token[];
+  constructor(tokens: Token[]) {
+    this.tokens = tokens;
+  }
 
   private peek(): Token | undefined {
     return this.tokens[this.pos];
@@ -347,7 +350,10 @@ type CtxValue =
 
 class Executor {
   errors: Array<{ message: string }> = [];
-  constructor(private readonly store: Store) {}
+  private readonly store: Store;
+  constructor(store: Store) {
+    this.store = store;
+  }
 
   execute(op: Operation, variables: Record<string, unknown>): Record<string, unknown> {
     const data: Record<string, unknown> = {};

@@ -80,7 +80,7 @@ function v2Advertisement(): Buffer {
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps =
     service === 'git-upload-pack'
-      ? 'side-band-64k thin-pack ofs-delta shallow multi_ack symref=HEAD:refs/heads/main agent=makefun-forge/1.0'
+      ? 'side-band-64k thin-pack ofs-delta shallow multi_ack multi_ack_detailed symref=HEAD:refs/heads/main agent=makefun-forge/1.0'
       : 'report-status side-band-64k delete-refs ofs-delta agent=makefun-forge/1.0';
   const parts: Buffer[] = [];
   parts.push(pktLine(`# service=${service}\n`));
@@ -218,15 +218,19 @@ function sidebandPackets(pack: Buffer): Buffer[] {
 function fetchV2(repo: Repo, plan: FetchPlan): Buffer {
   const sel = selectFetch(repo, plan);
   const parts: Buffer[] = [];
-  // acknowledgments
-  parts.push(pktLine('acknowledgments\n'));
-  if (sel.hasCommon) {
-    for (const ack of sel.acks) parts.push(pktLine(`ACK ${ack}\n`));
-    parts.push(pktLine('ready\n'));
-  } else {
-    parts.push(pktLine('NAK\n'));
+  // acknowledgments: only when the client sent haves. A fresh clone sends
+  // none, and real git errors if the section appears anyway (it expects the
+  // packfile header next). With haves, ACK each common have + 'ready', else NAK.
+  if (plan.haves.length > 0) {
+    parts.push(pktLine('acknowledgments\n'));
+    if (sel.hasCommon) {
+      for (const ack of sel.acks) parts.push(pktLine(`ACK ${ack}\n`));
+      parts.push(pktLine('ready\n'));
+    } else {
+      parts.push(pktLine('NAK\n'));
+    }
+    parts.push(pktDelim());
   }
-  parts.push(pktDelim());
   // shallow-info
   if (sel.shallow.length > 0 || sel.unshallow.length > 0) {
     parts.push(pktLine('shallow-info\n'));
@@ -420,7 +424,10 @@ function handleReceivePack(repo: Repo, req: GitRequest): GitResponse {
       else reportLines.push(`ng ${cmd.ref} ${result.reason}\n`);
     }
   }
-  const reportBody = encodePktLines(reportLines);
+  // The report-status stream is pkt-lined inside band 1 and ends with its own
+  // flush inside band 1; the outer stream then ends with a flush too. Real
+  // git waits for the inner flush before it trusts the report.
+  const reportBody = Buffer.concat([encodePktLines(reportLines), pktFlush()]);
   const parts: Buffer[] = [];
   const max = 65516;
   for (let offset = 0; offset < reportBody.length; offset += max) {
