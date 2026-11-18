@@ -120,10 +120,14 @@ function lsRefsV2(repo: Repo, args: { peel: boolean; symrefs: boolean; unborn: b
   const lines: string[] = [];
   const head = headOid(repo);
   const keep = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((p) => name.startsWith(p));
-  if (head === ZERO_OID) {
-    if (args.unborn) lines.push('unborn HEAD symref-target:refs/heads/main\n');
-  } else {
-    lines.push(`${head} HEAD symref-target:refs/heads/main\n`);
+  // HEAD is a ref like any other for prefix filtering: a `ref-prefix refs/heads/`
+  // request must not see it, and an unmatched prefix must see nothing at all.
+  if (keep('HEAD')) {
+    if (head === ZERO_OID) {
+      if (args.unborn) lines.push('unborn HEAD symref-target:refs/heads/main\n');
+    } else {
+      lines.push(`${head} HEAD symref-target:refs/heads/main\n`);
+    }
   }
   for (const ref of sortedRefs(repo)) {
     if (!keep(ref.name)) continue;
@@ -164,7 +168,12 @@ interface FetchSelection {
 function selectFetch(repo: Repo, plan: FetchPlan): FetchSelection {
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
   const stopAt = new Set(plan.shallowBoundaries);
-  const wantClosure = collectClosure(lookup, plan.wants, { depthLimit: plan.depth ?? undefined, stopAt });
+  // The want walk is bounded by `depth` alone: the client's shallow boundaries
+  // are commits it holds without their parents, not places to stop walking
+  // from a want — stopping there would make a `deepen` fetch send nothing
+  // (the want itself is the boundary). The boundaries only limit the *have*
+  // walk: a have the client holds shallowly does not imply its ancestors.
+  const wantClosure = collectClosure(lookup, plan.wants, { depthLimit: plan.depth ?? undefined });
   const haveClosure = plan.haves.length
     ? collectClosure(lookup, plan.haves, { stopAt })
     : { objects: new Set<string>(), commitDist: new Map<string, number>(), boundary: [] as string[] };
@@ -205,9 +214,15 @@ function selectFetch(repo: Repo, plan: FetchPlan): FetchSelection {
   return { send, sendOids, shallow, unshallow, acks, hasCommon: acks.length > 0 };
 }
 
+/** Largest pack bytes in one sideband packet: a pkt-line is at most 65520 bytes
+ *  (4 length bytes + payload), and the payload carries one band byte, so the
+ *  pack chunk is 65520 - 4 - 1. A 65516-byte chunk made a 65521-byte pkt-line,
+ *  which a strict decoder rejects. */
+const SIDEBAND_MAX_CHUNK = 65515;
+
 function sidebandPackets(pack: Buffer): Buffer[] {
   const out: Buffer[] = [];
-  const max = 65516;
+  const max = SIDEBAND_MAX_CHUNK;
   for (let offset = 0; offset < pack.length; offset += max) {
     const chunk = pack.subarray(offset, Math.min(pack.length, offset + max));
     out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
@@ -331,10 +346,19 @@ function handleUploadPack(repo: Repo, req: GitRequest): GitResponse {
     }
     return { status: 400, contentType: 'text/plain; charset=utf-8', body: Buffer.from('unknown command\n') };
   }
-  // Protocol v0 fetch: wants, then flush, then haves + done + flush.
-  let packets;
+  // Protocol v0 fetch: wants, then flush, then haves + done + flush. The
+  // request has two pkt-line sections, so decode past the first flush to
+  // reach the negotiation section; decoding only the first section would
+  // silently drop every `have` and re-send the whole history.
+  let packets: DecodedPacket[] = [];
   try {
-    packets = decodePktLines(req.body).packets;
+    let offset = 0;
+    while (offset < req.body.length) {
+      const decoded = decodePktLines(req.body.subarray(offset));
+      packets.push(...decoded.packets);
+      if (decoded.offset <= 0) break;
+      offset += decoded.offset;
+    }
   } catch {
     return { status: 400, contentType: 'text/plain; charset=utf-8', body: Buffer.from('bad pkt-line\n') };
   }
@@ -429,7 +453,7 @@ function handleReceivePack(repo: Repo, req: GitRequest): GitResponse {
   // git waits for the inner flush before it trusts the report.
   const reportBody = Buffer.concat([encodePktLines(reportLines), pktFlush()]);
   const parts: Buffer[] = [];
-  const max = 65516;
+  const max = SIDEBAND_MAX_CHUNK;
   for (let offset = 0; offset < reportBody.length; offset += max) {
     const chunk = reportBody.subarray(offset, Math.min(reportBody.length, offset + max));
     parts.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));

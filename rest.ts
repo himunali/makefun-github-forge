@@ -115,11 +115,14 @@ function commitsOf(store: Store, repo: Repo, ref: string): Array<Record<string, 
 
 function commitJson(store: Store, repo: Repo, oid: string, view: ReturnType<typeof parseCommit>): Record<string, unknown> {
   const owner = store.ownerLogin(repo);
+  // The stored message ends with the newline buildCommit appends; the API
+  // reports it without that trailing newline.
+  const message = view.message.endsWith('\n') ? view.message.slice(0, -1) : view.message;
   return {
     sha: oid,
     node_id: store.globalId('Commit', oid),
     commit: {
-      message: view.message,
+      message,
       tree: { sha: view.tree },
       author: { name: view.author.split(' <')[0] ?? view.author, email: '', date: isoFromSec(view.authorTs || store.baseSec) },
       committer: { name: view.committer.split(' <')[0] ?? view.committer, email: '', date: isoFromSec(view.committerTs || store.baseSec) },
