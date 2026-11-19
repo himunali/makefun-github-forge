@@ -19,11 +19,22 @@ export interface RestResponse {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  // Pre-serialized JSON body (already includes the trailing newline
+  // sendJson appends). When set, app.ts sends it verbatim instead of
+  // re-stringifying `body`; `body` is then ignored.
+  bodyRaw?: string;
 }
 
 const json = (status: number, body: unknown, headers: Record<string, string> = {}): RestResponse => ({
   status,
   body,
+  headers,
+});
+
+const jsonRaw = (status: number, bodyRaw: string, headers: Record<string, string> = {}): RestResponse => ({
+  status,
+  body: null,
+  bodyRaw,
   headers,
 });
 
@@ -100,8 +111,9 @@ function commitsOf(store: Store, repo: Repo, ref: string): Array<Record<string, 
   const out: Array<Record<string, unknown>> = [];
   const seen = new Set<string>();
   const queue: string[] = [tip];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = lookup(oid);
@@ -450,7 +462,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse | null 
           if (title === '') return err(422, 'title is required');
           const created = store.createIssue(repo, title, str(body.body), labelNamesOf(body.labels));
           if ('error' in created) return err(422, created.error);
-          return json(201, store.issueJson(repo, created));
+          return jsonRaw(201, store.issueJsonString(repo, created));
         }
         return err(404, 'Not Found');
       }
@@ -459,7 +471,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse | null 
       const issue: Issue | undefined = repo.issues.get(number);
       if (tail.length === 2) {
         if (!issue) return err(404, 'Not Found');
-        if (method === 'GET') return json(200, store.issueJson(repo, issue));
+        if (method === 'GET') return jsonRaw(200, store.issueJsonString(repo, issue));
         if (method === 'PATCH') {
           const body = bodyOf(req);
           if (typeof body.title === 'string') issue.title = body.title;
@@ -476,7 +488,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse | null 
             }
             issue.labels = labels;
           }
-          return json(200, store.issueJson(repo, issue));
+          return jsonRaw(200, store.issueJsonString(repo, issue));
         }
         return err(404, 'Not Found');
       }

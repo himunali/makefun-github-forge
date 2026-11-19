@@ -130,6 +130,9 @@ export interface Repo {
   createdAt: string;
   updatedAt: string;
   pushedAt: string | null;
+  // Serialized single-issue JSON cache (see Store.issueJsonString): keyed by
+  // issue number, validated by a fingerprint of every field issueJson reads.
+  issueJsonCache: Map<number, { fp: string; json: string }>;
 }
 
 export class Store {
@@ -196,6 +199,7 @@ export class Store {
       createdAt: isoFromSec(sec),
       updatedAt: isoFromSec(sec),
       pushedAt: null,
+      issueJsonCache: new Map(),
     };
     this.reposByName.set(name, repo);
     this.reposById.set(id, repo);
@@ -724,6 +728,40 @@ export class Store {
       repository_url: `/api/v3/repos/${owner}/${repo.name}`,
       author_association: 'OWNER',
     };
+  }
+
+  /**
+   * Serialized single-issue JSON (with the trailing newline sendJson appends),
+   * cached per issue. The fingerprint covers EVERY input issueJson reads
+   * (resolved owner, repo id/name, all mutable issue fields incl. each label's
+   * id/name/color/description, comment count, timestamps), with length
+   * prefixes on free-text fields so two different inputs can never collide
+   * into the same fingerprint. A fingerprint hit therefore cannot serve a
+   * stale body, and the cache needs no invalidation sites at all.
+   */
+  issueJsonString(repo: Repo, issue: Issue): string {
+    const lp = (s: string): string => `${s.length}:${s}`;
+    const owner = this.ownerLogin(repo);
+    const fp = [
+      lp(owner),
+      repo.id,
+      lp(repo.name),
+      issue.id,
+      issue.number,
+      lp(issue.title),
+      lp(issue.body),
+      issue.state,
+      issue.labels.map((l) => `${l.id}:${lp(l.name)}:${lp(l.color)}:${lp(l.description)}`).join(','),
+      issue.comments.length,
+      issue.createdAt,
+      issue.updatedAt,
+      issue.closedAt ?? '',
+    ].join('\u0000');
+    const hit = repo.issueJsonCache.get(issue.number);
+    if (hit !== undefined && hit.fp === fp) return hit.json;
+    const json = `${JSON.stringify(this.issueJson(repo, issue))}\n`;
+    repo.issueJsonCache.set(issue.number, { fp, json });
+    return json;
   }
 
   commentJson(repo: Repo, issue: Issue, comment: Comment): Record<string, unknown> {

@@ -66,11 +66,18 @@ export function decodePktLines(buf: Buffer, maxPackets = 100000): { packets: Dec
   const packets: DecodedPacket[] = [];
   let offset = 0;
   while (offset + 4 <= buf.length) {
-    const head = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) {
-      throw new Error(`bad pkt-line length ${JSON.stringify(head)} at offset ${offset}`);
+    // Manual hex check: the regex /^[0-9a-fA-F]{4}$/ on every packet was
+    // measurable in push/fetch paths that decode many small packets.
+    const h0 = buf[offset] as number;
+    const h1 = buf[offset + 1] as number;
+    const h2 = buf[offset + 2] as number;
+    const h3 = buf[offset + 3] as number;
+    const isHex = (c: number): boolean =>
+      (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66) || (c >= 0x41 && c <= 0x46);
+    if (!isHex(h0) || !isHex(h1) || !isHex(h2) || !isHex(h3)) {
+      throw new Error(`bad pkt-line length ${JSON.stringify(buf.subarray(offset, offset + 4).toString('ascii'))} at offset ${offset}`);
     }
-    const len = parseInt(head, 16);
+    const len = parseInt(buf.subarray(offset, offset + 4).toString('ascii'), 16);
     if (len === 0) {
       packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
       return { packets, offset: offset + 4 };
@@ -113,7 +120,7 @@ export interface TreeEntry {
 
 /** Parse a tree object's entries. */
 export function parseTree(data: Uint8Array): TreeEntry[] {
-  const buf = Buffer.from(data);
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < buf.length) {
@@ -158,7 +165,7 @@ export interface CommitView {
 
 /** Parse a commit object's headers and message. */
 export function parseCommit(data: Uint8Array): CommitView {
-  const text = Buffer.from(data).toString('utf8');
+  const text = (Buffer.isBuffer(data) ? data : Buffer.from(data)).toString('utf8');
   const split = text.indexOf('\n\n');
   const head = split < 0 ? text : text.slice(0, split);
   const message = split < 0 ? '' : text.slice(split + 2);
@@ -212,7 +219,7 @@ export interface TagView {
 
 /** Parse an annotated tag object's headers and message. */
 export function parseTag(data: Uint8Array): TagView {
-  const text = Buffer.from(data).toString('utf8');
+  const text = (Buffer.isBuffer(data) ? data : Buffer.from(data)).toString('utf8');
   const split = text.indexOf('\n\n');
   const head = split < 0 ? text : text.slice(0, split);
   const message = split < 0 ? '' : text.slice(split + 2);
@@ -293,13 +300,14 @@ export function inflateAt(buf: Buffer, offset: number): { data: Buffer; next: nu
   }
   const written = result.engine.bytesWritten;
   if (!written || written <= 0) throw new Error(`zlib stream at offset ${offset} consumed no bytes`);
-  return { data: Buffer.from(result.buffer), next: offset + written };
+  // result.buffer already is the inflated Buffer; copying it again was pure waste.
+  return { data: result.buffer, next: offset + written };
 }
 
 /** Apply a git delta instruction stream to a base object's bytes. */
 export function applyDelta(base: Uint8Array, delta: Uint8Array): Buffer {
-  const baseBuf = Buffer.from(base);
-  const deltaBuf = Buffer.from(delta);
+  const baseBuf = Buffer.isBuffer(base) ? base : Buffer.from(base);
+  const deltaBuf = Buffer.isBuffer(delta) ? delta : Buffer.from(delta);
   let offset = 0;
   const readSize = (): number => {
     let value = 0;
@@ -379,7 +387,7 @@ interface RawEntry {
  * entry or an unresolvable delta.
  */
 export function readPack(pack: Uint8Array, resolveBase?: ObjectLookup): Map<string, GitObject> {
-  const buf = Buffer.from(pack);
+  const buf = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
   if (buf.length < 32) throw new Error(`pack is ${buf.length} bytes, too short`);
   if (buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack does not start with PACK');
   const version = buf.readUInt32BE(4);
@@ -488,7 +496,10 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
-/** Build a packfile from plain objects (no deltas), in the caller's order. */
+/** Build a packfile from plain objects (no deltas), in the caller's order.
+ *  Deflate level 1: pack bytes travel over loopback to the suite, so ratio
+ *  barely matters and level 1 is several times faster than the default 6.
+ *  The stream stays a valid zlib stream any git client inflates. */
 export function writePack(objects: readonly GitObject[]): Buffer {
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
@@ -498,7 +509,7 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   parts.push(header);
   for (const object of objects) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -559,8 +570,11 @@ export function collectClosure(
     }
   }
   const boundary: string[] = [];
-  while (queue.length > 0) {
-    const item = queue.shift() as { oid: string; dist: number };
+  // Index-based queue: Array.shift() is O(n) per pop and these walks run
+  // once per fetch/clone, so a shifting queue is quadratic in history size.
+  let head = 0;
+  while (head < queue.length) {
+    const item = queue[head++] as { oid: string; dist: number };
     const commitObj = lookup(item.oid);
     if (!commitObj || commitObj.type !== 'commit') continue;
     objects.add(item.oid);
@@ -600,8 +614,9 @@ export function isAncestor(lookup: ObjectLookup, ancestor: string, descendant: s
   if (ancestor === descendant) return true;
   const seen = new Set<string>();
   const queue: string[] = [descendant];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = lookup(oid);
@@ -623,8 +638,9 @@ export function isAncestor(lookup: ObjectLookup, ancestor: string, descendant: s
 export function mergeBase(lookup: ObjectLookup, a: string, b: string): string | null {
   const ancestorsA = new Set<string>();
   const queueA: string[] = [peelObject(lookup, a).oid];
-  while (queueA.length > 0) {
-    const oid = queueA.shift() as string;
+  let headA = 0;
+  while (headA < queueA.length) {
+    const oid = queueA[headA++] as string;
     if (ancestorsA.has(oid)) continue;
     ancestorsA.add(oid);
     const obj = lookup(oid);
@@ -632,8 +648,9 @@ export function mergeBase(lookup: ObjectLookup, a: string, b: string): string | 
   }
   const seen = new Set<string>();
   const queueB: string[] = [peelObject(lookup, b).oid];
-  while (queueB.length > 0) {
-    const oid = queueB.shift() as string;
+  let headB = 0;
+  while (headB < queueB.length) {
+    const oid = queueB[headB++] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (ancestorsA.has(oid)) return oid;
@@ -664,8 +681,9 @@ export function listCommits(lookup: ObjectLookup, tip: string): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   const queue: string[] = [peelObject(lookup, tip).oid];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = lookup(oid);

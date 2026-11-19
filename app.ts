@@ -18,21 +18,15 @@ function header(req: IncomingMessage, name: string): string | null {
   return value ?? null;
 }
 
-function lowerHeaders(req: IncomingMessage): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (typeof value === 'string') out[key.toLowerCase()] = value;
-    else if (Array.isArray(value) && value[0] !== undefined) out[key.toLowerCase()] = value[0];
-  }
-  return out;
-}
-
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
+    let total = 0;
     req.on('data', (chunk: Buffer) => {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      if (chunks.reduce((n, c) => n + c.length, 0) > 64 * 1024 * 1024) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      chunks.push(buf);
+      total += buf.length;
+      if (total > 64 * 1024 * 1024) {
         reject(new Error('request body too large'));
         req.destroy();
       }
@@ -72,7 +66,9 @@ export function createApp(): Server {
           pathname = '/';
         }
         const host = header(req, 'host') ?? '127.0.0.1';
-        const headers = lowerHeaders(req);
+        // Node already lowercases incoming header names, so req.headers is
+        // the lowered map the git handler wants; no per-request copy.
+        const headers: Record<string, string> = req.headers as Record<string, string>;
 
         // Health probe: no auth, always up.
         if (method === 'GET' && pathname === '/healthz') {
@@ -89,7 +85,11 @@ export function createApp(): Server {
         }
 
         const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
-        const bodyText = body.toString('utf8');
+        // Lazily decoded: git routes work on the raw Buffer and never need
+        // the UTF-8 text, so decoding every pack body to a string (and
+        // throwing it away) was pure waste on pushes and fetches.
+        let bodyTextCache: string | null = null;
+        const bodyText = (): string => (bodyTextCache ??= body.toString('utf8'));
 
         // Git smart HTTP: /{owner}/{repo}.git/...
         if (pathname.includes('.git/') || pathname.endsWith('.git')) {
@@ -112,9 +112,9 @@ export function createApp(): Server {
           }
           let parsed: unknown = null;
           let parseFailed = false;
-          if (bodyText.trim() !== '') {
+          if (bodyText().trim() !== '') {
             try {
-              parsed = JSON.parse(bodyText);
+              parsed = JSON.parse(bodyText());
             } catch {
               parseFailed = true;
             }
@@ -123,14 +123,14 @@ export function createApp(): Server {
             sendJson(res, 400, { errors: [{ message: 'Request body is not valid JSON' }] }, { 'x-github-request-id': requestId });
             return;
           }
-          const result = handleGraphQL(store, { method, bodyText, body: parsed });
+          const result = handleGraphQL(store, { method, bodyText: bodyText(), body: parsed });
           sendJson(res, result.status, result.body, { 'x-github-request-id': requestId });
           return;
         }
 
         // MCP.
         if (pathname === '/mcp') {
-          const result = handleMcp(store, { method, bodyText, body: null, headers });
+          const result = handleMcp(store, { method, bodyText: bodyText(), body: null, headers });
           if (result.body === null) {
             res.writeHead(result.status, { 'x-github-request-id': requestId, ...(result.headers ?? {}) });
             res.end();
@@ -145,9 +145,9 @@ export function createApp(): Server {
           let parsed: unknown = null;
           let parseFailed = false;
           const needsJson = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
-          if (needsJson && bodyText.trim() !== '') {
+          if (needsJson && bodyText().trim() !== '') {
             try {
-              parsed = JSON.parse(bodyText);
+              parsed = JSON.parse(bodyText());
             } catch {
               parseFailed = true;
             }
@@ -156,12 +156,16 @@ export function createApp(): Server {
             sendJson(res, 400, { message: 'Invalid JSON body' }, { 'x-github-request-id': requestId });
             return;
           }
-          const restReq: RestRequest = { method, path: pathname, query, headers, bodyText, body: parsed, host };
+          const restReq: RestRequest = { method, path: pathname, query, headers, bodyText: bodyText(), body: parsed, host };
           const restRes = handleRest(store, restReq);
           if (restRes !== null) {
             if (restRes.status === 204) {
               res.writeHead(204, { 'content-type': JSON_TYPE, 'x-github-request-id': requestId, ...(restRes.headers ?? {}) });
               res.end();
+              return;
+            }
+            if (restRes.bodyRaw !== undefined) {
+              sendBuffer(res, restRes.status, JSON_TYPE, Buffer.from(restRes.bodyRaw, 'utf8'), { 'x-github-request-id': requestId, ...(restRes.headers ?? {}) });
               return;
             }
             sendJson(res, restRes.status, restRes.body, { 'x-github-request-id': requestId, ...(restRes.headers ?? {}) });

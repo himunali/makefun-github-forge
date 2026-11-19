@@ -67,14 +67,28 @@ function headOid(repo: Repo): string {
 // ---------------------------------------------------------------------------
 
 function v2Advertisement(): Buffer {
-  return encodePktLines([
-    'version 2\n',
-    'agent=makefun-forge/1.0\n',
-    'ls-refs=unborn\n',
-    'fetch=shallow\n',
-    'object-format=sha1\n',
-    'flush',
-  ]);
+  return V2_ADVERTISEMENT;
+}
+
+/** The v2 advertisement never varies: prebuilt once, shared by every call. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  'version 2\n',
+  'agent=makefun-forge/1.0\n',
+  'ls-refs=unborn\n',
+  'fetch=shallow\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
+/**
+ * One pkt-line frame for a text line, as a string: the 4-hex length prefix
+ * plus the payload. String framing lets advertisement / ls-refs answers be
+ * built as a single string and turned into one Buffer, instead of one
+ * Buffer.alloc + Buffer.concat per line.
+ */
+function pktLineStr(payload: string): string {
+  const len = Buffer.byteLength(payload, 'utf8') + 4;
+  return len.toString(16).padStart(4, '0') + payload;
 }
 
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
@@ -82,26 +96,24 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
     service === 'git-upload-pack'
       ? 'side-band-64k thin-pack ofs-delta shallow multi_ack multi_ack_detailed symref=HEAD:refs/heads/main agent=makefun-forge/1.0'
       : 'report-status side-band-64k delete-refs ofs-delta agent=makefun-forge/1.0';
-  const parts: Buffer[] = [];
-  parts.push(pktLine(`# service=${service}\n`));
-  parts.push(pktFlush());
+  let out = pktLineStr(`# service=${service}\n`) + '0000';
   const refs = sortedRefs(repo);
   if (refs.length === 0) {
-    parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    out += pktLineStr(`${ZERO_OID} capabilities^{}\0${caps}\n`);
   } else {
     const head = headOid(repo);
-    parts.push(pktLine(`${head} HEAD\0${caps}\n`));
+    out += pktLineStr(`${head} HEAD\0${caps}\n`);
     for (const ref of refs) {
-      parts.push(pktLine(`${ref.oid} ${ref.name}\n`));
+      out += pktLineStr(`${ref.oid} ${ref.name}\n`);
       const obj = repo.objects.get(ref.oid);
       if (obj && obj.type === 'tag') {
         const peeled = peelToCommit(repo, ref.oid);
-        if (peeled) parts.push(pktLine(`${peeled} ${ref.name}^{}\n`));
+        if (peeled) out += pktLineStr(`${peeled} ${ref.name}^{}\n`);
       }
     }
   }
-  parts.push(pktFlush());
-  return Buffer.concat(parts);
+  out += '0000';
+  return Buffer.from(out, 'utf8');
 }
 
 function infoRefs(store: Store, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack', protocol: string | null): GitResponse {
@@ -117,16 +129,16 @@ function infoRefs(store: Store, repo: Repo, service: 'git-upload-pack' | 'git-re
 // ---------------------------------------------------------------------------
 
 function lsRefsV2(repo: Repo, args: { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[] }): Buffer {
-  const lines: string[] = [];
+  let out = '';
   const head = headOid(repo);
   const keep = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((p) => name.startsWith(p));
   // HEAD is a ref like any other for prefix filtering: a `ref-prefix refs/heads/`
   // request must not see it, and an unmatched prefix must see nothing at all.
   if (keep('HEAD')) {
     if (head === ZERO_OID) {
-      if (args.unborn) lines.push('unborn HEAD symref-target:refs/heads/main\n');
+      if (args.unborn) out += pktLineStr('unborn HEAD symref-target:refs/heads/main\n');
     } else {
-      lines.push(`${head} HEAD symref-target:refs/heads/main\n`);
+      out += pktLineStr(`${head} HEAD symref-target:refs/heads/main\n`);
     }
   }
   for (const ref of sortedRefs(repo)) {
@@ -137,10 +149,10 @@ function lsRefsV2(repo: Repo, args: { peel: boolean; symrefs: boolean; unborn: b
       const peeled = peelToCommit(repo, ref.oid);
       if (peeled) line += ` peeled:${peeled}`;
     }
-    lines.push(`${line}\n`);
+    out += pktLineStr(`${line}\n`);
   }
-  lines.push('flush');
-  return encodePktLines(lines as Array<string | 'flush'>);
+  out += '0000';
+  return Buffer.from(out, 'utf8');
 }
 
 // ---------------------------------------------------------------------------
@@ -220,12 +232,43 @@ function selectFetch(repo: Repo, plan: FetchPlan): FetchSelection {
  *  which a strict decoder rejects. */
 const SIDEBAND_MAX_CHUNK = 65515;
 
+/**
+ * Memoized packs. writePack is a pure function of the (type, data) list, and
+ * objects are content-addressed and immutable, so one sorted oid set always
+ * builds the same pack bytes. A clone run fetches the same tip fifty times;
+ * building that pack once and reusing its bytes is what real forges do with
+ * pack reuse (git's pack.allowPackReuse). Bounded so a long trial cannot
+ * grow it without limit; the cached Buffer is only ever read via subarray.
+ */
+const PACK_CACHE_MAX = 128;
+const packCache = new Map<string, Buffer>();
+function packFor(sendOids: Set<string>, send: GitObject[]): Buffer {
+  const key = [...sendOids].sort().join(',');
+  const hit = packCache.get(key);
+  if (hit) return hit;
+  const pack = writePack(send);
+  if (packCache.size >= PACK_CACHE_MAX) {
+    const oldest = packCache.keys().next().value;
+    if (oldest !== undefined) packCache.delete(oldest);
+  }
+  packCache.set(key, pack);
+  return pack;
+}
+
 function sidebandPackets(pack: Buffer): Buffer[] {
   const out: Buffer[] = [];
   const max = SIDEBAND_MAX_CHUNK;
   for (let offset = 0; offset < pack.length; offset += max) {
-    const chunk = pack.subarray(offset, Math.min(pack.length, offset + max));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+    const chunkLen = Math.min(pack.length - offset, max);
+    // One allocation for the whole sideband packet (4 length bytes + 1 band
+    // byte + chunk) instead of Buffer.concat([band, chunk]) then pktLine's
+    // own concat: two fewer allocations per packet.
+    const total = chunkLen + 5;
+    const packet = Buffer.allocUnsafe(total);
+    packet.write(total.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    packet[4] = 1;
+    pack.copy(packet, 5, offset, offset + chunkLen);
+    out.push(packet);
   }
   return out;
 }
@@ -256,7 +299,7 @@ function fetchV2(repo: Repo, plan: FetchPlan): Buffer {
   // packfile
   if (sel.send.length > 0) {
     parts.push(pktLine('packfile\n'));
-    const pack = writePack(sel.send);
+    const pack = packFor(sel.sendOids, sel.send);
     for (const packet of sidebandPackets(pack)) parts.push(packet);
   }
   parts.push(pktFlush());
@@ -274,7 +317,7 @@ function fetchV0(repo: Repo, plan: FetchPlan): Buffer {
   for (const oid of sel.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of sel.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   if (sel.send.length > 0) {
-    const pack = writePack(sel.send);
+    const pack = packFor(sel.sendOids, sel.send);
     for (const packet of sidebandPackets(pack)) parts.push(packet);
   }
   parts.push(pktFlush());
@@ -455,8 +498,13 @@ function handleReceivePack(repo: Repo, req: GitRequest): GitResponse {
   const parts: Buffer[] = [];
   const max = SIDEBAND_MAX_CHUNK;
   for (let offset = 0; offset < reportBody.length; offset += max) {
-    const chunk = reportBody.subarray(offset, Math.min(reportBody.length, offset + max));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+    const chunkLen = Math.min(reportBody.length - offset, max);
+    const total = chunkLen + 5;
+    const packet = Buffer.allocUnsafe(total);
+    packet.write(total.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    packet[4] = 1;
+    reportBody.copy(packet, 5, offset, offset + chunkLen);
+    parts.push(packet);
   }
   parts.push(pktFlush());
   return { status: 200, contentType: RECEIVE_RESULT, body: Buffer.concat(parts) };
