@@ -7,7 +7,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -80,7 +79,11 @@ func readRequest(r *bufio.Reader) (*httpRequest, error) {
 	req := &httpRequest{Method: parts[0], RawPath: parts[1], Version: parts[2], Headers: map[string]string{}}
 	path, queryStr, _ := strings.Cut(parts[1], "?")
 	req.Path = path
-	if q, err := url.ParseQuery(queryStr); err == nil {
+	if queryStr == "" {
+		// No query string: skip url.ParseQuery (it allocates a map +
+		// slices per request). All Query lookups are nil-map safe.
+		req.Query = nil
+	} else if q, err := url.ParseQuery(queryStr); err == nil {
 		req.Query = q
 	} else {
 		req.Query = map[string][]string{}
@@ -191,19 +194,70 @@ func readBody(r *bufio.Reader, req *httpRequest, w *bufio.Writer) error {
 	return nil
 }
 
+// Precomputed status lines: writeResponse used to fmt.Sprintf + build a
+// bytes.Buffer per response; the read workload alone does 2,000 of them.
+var statusLines = map[int]string{
+	200: "HTTP/1.1 200 OK\r\n",
+	201: "HTTP/1.1 201 Created\r\n",
+	202: "HTTP/1.1 202 Accepted\r\n",
+	204: "HTTP/1.1 204 No Content\r\n",
+	400: "HTTP/1.1 400 Bad Request\r\n",
+	401: "HTTP/1.1 401 Unauthorized\r\n",
+	404: "HTTP/1.1 404 Not Found\r\n",
+	405: "HTTP/1.1 405 Method Not Allowed\r\n",
+	409: "HTTP/1.1 409 Conflict\r\n",
+	422: "HTTP/1.1 422 Unprocessable Entity\r\n",
+	500: "HTTP/1.1 500 Internal Server Error\r\n",
+}
+
 func writeResponse(w *bufio.Writer, resp httpResponse) error {
-	var buf bytes.Buffer
-	buf.WriteString(statusLine(resp.Status))
+	line, ok := statusLines[resp.Status]
+	if !ok {
+		line = statusLine(resp.Status)
+	}
+	if _, err := w.WriteString(line); err != nil {
+		return err
+	}
 	if resp.ContentType != "" {
-		buf.WriteString("Content-Type: " + resp.ContentType + "\r\n")
+		if _, err := w.WriteString("Content-Type: "); err != nil {
+			return err
+		}
+		if _, err := w.WriteString(resp.ContentType); err != nil {
+			return err
+		}
+		if _, err := w.WriteString("\r\n"); err != nil {
+			return err
+		}
 	}
-	buf.WriteString("Content-Length: " + strconv.Itoa(len(resp.Body)) + "\r\n")
+	var numBuf [20]byte
+	num := strconv.AppendInt(numBuf[:0], int64(len(resp.Body)), 10)
+	if _, err := w.WriteString("Content-Length: "); err != nil {
+		return err
+	}
+	if _, err := w.Write(num); err != nil {
+		return err
+	}
+	if _, err := w.WriteString("\r\n"); err != nil {
+		return err
+	}
 	for k, v := range resp.Extra {
-		buf.WriteString(k + ": " + v + "\r\n")
+		if _, err := w.WriteString(k); err != nil {
+			return err
+		}
+		if _, err := w.WriteString(": "); err != nil {
+			return err
+		}
+		if _, err := w.WriteString(v); err != nil {
+			return err
+		}
+		if _, err := w.WriteString("\r\n"); err != nil {
+			return err
+		}
 	}
-	buf.WriteString("\r\n")
-	buf.Write(resp.Body)
-	if _, err := w.Write(buf.Bytes()); err != nil {
+	if _, err := w.WriteString("\r\n"); err != nil {
+		return err
+	}
+	if _, err := w.Write(resp.Body); err != nil {
 		return err
 	}
 	return w.Flush()
@@ -215,7 +269,15 @@ func writeResponse(w *bufio.Writer, resp httpResponse) error {
 
 type server struct {
 	store *Store
-	mu    sync.Mutex
+	// RWMutex: the store is read-mostly, and the clone workload fires 50
+	// concurrent read-only clones. Serializing them on a plain Mutex
+	// costs a full round-trip each; readers run in parallel now.
+	// All store access happens inside handle() under this lock:
+	// GETs and git-upload-pack take the read lock, everything else
+	// (receive-pack, REST writes, GraphQL, MCP) takes the write lock.
+	// Per-request mutations that used to hide behind the mutex
+	// (NextRequestId, the pack/fetch caches) are atomic / own-mutex now.
+	mu sync.RWMutex
 }
 
 func (s *server) handle(req *httpRequest) (resp httpResponse, keepAlive bool) {
@@ -332,9 +394,23 @@ func (s *server) serveConn(conn net.Conn) {
 		if err := readBody(r, req, w); err != nil {
 			return
 		}
-		s.mu.Lock()
-		resp, keepAlive := s.handle(req)
-		s.mu.Unlock()
+		// Read-only requests run concurrently under the read lock; every
+		// mutation takes the write lock. GETs are reads by construction
+		// in this forge (no GET handler mutates the store); POST
+		// git-upload-pack is read-only, POST git-receive-pack mutates.
+		// GraphQL/MCP stay on the write lock (a POST body may mutate).
+		readOnly := req.Method == "GET" || (req.Method == "POST" && strings.Contains(req.Path, "git-upload-pack"))
+		var resp httpResponse
+		var keepAlive bool
+		if readOnly {
+			s.mu.RLock()
+			resp, keepAlive = s.handle(req)
+			s.mu.RUnlock()
+		} else {
+			s.mu.Lock()
+			resp, keepAlive = s.handle(req)
+			s.mu.Unlock()
+		}
 		if err := writeResponse(w, resp); err != nil {
 			return
 		}

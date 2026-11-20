@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type GitRequest struct {
@@ -263,6 +264,13 @@ const sidebandMaxChunk = 65515
 
 const packCacheMax = 128
 
+// cacheMu guards packCache/fetchCache + their eviction order. Cache
+// misses write, and misses happen on read-only requests (clone fetches)
+// that now run concurrently under the server's read lock, so the caches
+// need their own lock. Lookups are the hot path (clone hits), hence
+// RWMutex.
+var cacheMu sync.RWMutex
+
 var packCache = map[string][]byte{}
 var packCacheOrder []string
 
@@ -273,17 +281,24 @@ func packFor(sendOids map[string]bool, send []*GitObject) []byte {
 	}
 	sort.Strings(keys)
 	key := strings.Join(keys, ",")
-	if hit, ok := packCache[key]; ok {
+	cacheMu.RLock()
+	hit, ok := packCache[key]
+	cacheMu.RUnlock()
+	if ok {
 		return hit
 	}
 	pack := writePack(send)
-	if len(packCache) >= packCacheMax && len(packCacheOrder) > 0 {
-		oldest := packCacheOrder[0]
-		delete(packCache, oldest)
-		packCacheOrder = packCacheOrder[1:]
+	cacheMu.Lock()
+	if _, dup := packCache[key]; !dup {
+		if len(packCache) >= packCacheMax && len(packCacheOrder) > 0 {
+			oldest := packCacheOrder[0]
+			delete(packCache, oldest)
+			packCacheOrder = packCacheOrder[1:]
+		}
+		packCache[key] = pack
+		packCacheOrder = append(packCacheOrder, key)
 	}
-	packCache[key] = pack
-	packCacheOrder = append(packCacheOrder, key)
+	cacheMu.Unlock()
 	return pack
 }
 
@@ -327,11 +342,18 @@ func fetchCacheKey(kind string, repo *Repo, plan FetchPlan) string {
 }
 
 func fetchCacheGet(key string) ([]byte, bool) {
+	cacheMu.RLock()
 	v, ok := fetchCache[key]
+	cacheMu.RUnlock()
 	return v, ok
 }
 
 func fetchCachePut(key string, body []byte) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	if _, dup := fetchCache[key]; dup {
+		return
+	}
 	if len(fetchCache) >= 128 && len(fetchCacheOrder) > 0 {
 		oldest := fetchCacheOrder[0]
 		delete(fetchCache, oldest)

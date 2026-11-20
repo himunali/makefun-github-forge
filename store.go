@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -152,7 +154,10 @@ type Store struct {
 	Token        string
 	BaseSec      int64
 	seq          int
-	reqSeq       int
+	// NextRequestId is called on EVERY request, including read-only ones
+	// that now run concurrently under the read lock — so it must be
+	// atomic, not a plain increment behind the old global mutex.
+	reqSeq atomic.Uint64
 	repoIdSeq    int
 	objectIdSeq  int
 	labelIdSeq   int
@@ -177,8 +182,7 @@ func (s *Store) TickSec() int64 {
 }
 
 func (s *Store) NextRequestId() string {
-	s.reqSeq++
-	return fmt.Sprintf("req-%d", s.reqSeq)
+	return fmt.Sprintf("req-%d", s.reqSeq.Add(1))
 }
 
 func (s *Store) ViewerIdentity() string {
@@ -886,10 +890,86 @@ func (s *Store) IssueJson(repo *Repo, issue *Issue) map[string]any {
 	}
 }
 
+// Fingerprint-cached single-issue JSON.
+//
+// The read workload GETs the same issue 2,000 times on one connection;
+// rebuilding its map (IssueJson) and re-marshaling it (encoding/json
+// sorts map keys) on every GET is the read path's biggest server-side
+// cost. The TS round-3 fingerprint cache was skipped in the Go port on
+// the unmeasured claim that "Go marshaling is fast enough" — the read
+// workload's 473–758 ms says otherwise.
+//
+// Correctness: the fingerprint covers EVERY field IssueJson reads, so a
+// hit can never serve a stale body — any mutation changes the
+// fingerprint and the entry recomputes. Stored in a sync.Map keyed by
+// the issue pointer, so concurrent GETs under the read lock are
+// race-free (two goroutines computing the same value is harmless).
+// Pointer reuse after GC is safe too: the fingerprint carries repo.ID
+// + issue number + all fields, so a reused pointer for a different
+// issue cannot match the stored fingerprint.
+type issueJSONEntry struct {
+	fp   string
+	json string
+}
+
+var issueJSONCache sync.Map
+
+func writeFPText(b *strings.Builder, s string) {
+	b.WriteString(strconv.Itoa(len(s)))
+	b.WriteByte(':')
+	b.WriteString(s)
+	b.WriteByte(0)
+}
+
+func (s *Store) issueFingerprint(repo *Repo, issue *Issue) string {
+	var b strings.Builder
+	b.WriteString(strconv.Itoa(repo.ID))
+	b.WriteByte(0)
+	b.WriteString(s.OwnerLogin(repo))
+	b.WriteByte(0)
+	b.WriteString(repo.Name)
+	b.WriteByte(0)
+	b.WriteString(strconv.Itoa(issue.ID))
+	b.WriteByte(0)
+	b.WriteString(strconv.Itoa(issue.Number))
+	b.WriteByte(0)
+	writeFPText(&b, issue.Title)
+	writeFPText(&b, issue.Body)
+	b.WriteString(issue.State)
+	b.WriteByte(0)
+	b.WriteString(strconv.Itoa(len(issue.Comments)))
+	b.WriteByte(0)
+	b.WriteString(issue.CreatedAt)
+	b.WriteByte(0)
+	b.WriteString(issue.UpdatedAt)
+	b.WriteByte(0)
+	if issue.ClosedAt == nil {
+		b.WriteString("nil")
+	} else {
+		b.WriteString(*issue.ClosedAt)
+	}
+	for _, l := range issue.Labels {
+		b.WriteByte(0)
+		b.WriteString(strconv.Itoa(l.ID))
+		b.WriteByte(0)
+		writeFPText(&b, l.Name)
+		writeFPText(&b, l.Color)
+		writeFPText(&b, l.Description)
+	}
+	return b.String()
+}
+
 // Serialized single-issue JSON (with trailing newline, as sendJson appends).
-// Go marshaling is fast enough that the TS fingerprint cache is unnecessary.
 func (s *Store) IssueJsonString(repo *Repo, issue *Issue) string {
-	return jsonString(s.IssueJson(repo, issue)) + "\n"
+	fp := s.issueFingerprint(repo, issue)
+	if v, ok := issueJSONCache.Load(issue); ok {
+		if e, ok := v.(issueJSONEntry); ok && e.fp == fp {
+			return e.json
+		}
+	}
+	js := jsonString(s.IssueJson(repo, issue)) + "\n"
+	issueJSONCache.Store(issue, issueJSONEntry{fp: fp, json: js})
+	return js
 }
 
 func (s *Store) CommentJson(repo *Repo, issue *Issue, comment *Comment) map[string]any {
